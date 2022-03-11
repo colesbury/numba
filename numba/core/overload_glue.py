@@ -32,41 +32,25 @@ class _OverloadWrapper(object):
         and the presented kwargs, the "body_func" is the function that'll
         type the overloaded function and then work out which lowering to
         return"""
-        def stub(tyctx):
-            # body is supplied when the function is magic'd into life via glbls
-            return body(tyctx)  # noqa: F821
+
         if kwargs is None:
             kwargs = {}
-        # create new code parts
-        stub_code = stub.__code__
-        co_args = [stub_code.co_argcount + nargs + len(kwargs)]
 
-        new_varnames = [*stub_code.co_varnames]
-        new_varnames.extend([f'tmp{x}' for x in range(nargs)])
-        new_varnames.extend([x for x, _ in kwargs.items()])
-        from numba.core import utils
-        if utils.PYVERSION >= (3, 8):
-            co_args.append(stub_code.co_posonlyargcount)
-        co_args.append(stub_code.co_kwonlyargcount)
-        co_args.extend([stub_code.co_nlocals + nargs + len(kwargs),
-                        stub_code.co_stacksize,
-                        stub_code.co_flags,
-                        stub_code.co_code,
-                        stub_code.co_consts,
-                        stub_code.co_names,
-                        tuple(new_varnames),
-                        stub_code.co_filename,
-                        stub_code.co_name,
-                        stub_code.co_firstlineno,
-                        stub_code.co_lnotab,
-                        stub_code.co_freevars,
-                        stub_code.co_cellvars
-                        ])
+        args = ['tyctx']
+        args.extend([f'tmp{x}' for x in range(nargs)])
+        args.extend([x for x, _ in kwargs.items()])
 
-        new_code = pytypes.CodeType(*co_args)
+        g = {}
+        exec(textwrap.dedent(f"""
+        def stub({', '.join(args)}):
+            # body is supplied when the function is magic'd into life via glbls
+            return body(tyctx)  # noqa: F821
+        """), g)
+
+        stub = g['stub']
 
         # get function
-        new_func = pytypes.FunctionType(new_code, {'body': body_func})
+        new_func = pytypes.FunctionType(stub.__code__, {'body': body_func})
         return new_func
 
     def wrap_typing(self):

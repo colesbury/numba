@@ -12,7 +12,7 @@ opcode_info = namedtuple('opcode_info', ['argsize'])
 # The following offset is used as a hack to inject a NOP at the start of the
 # bytecode. So that function starting with `while True` will not have block-0
 # as a jump target. The Lowerer puts argument initialization at block-0.
-_FIXED_OFFSET = 2
+_FIXED_OFFSET = 0
 
 
 def get_function_object(obj):
@@ -37,16 +37,18 @@ def _as_opcodes(seq):
     for s in seq:
         c = dis.opmap.get(s)
         if c is not None:
-            lst.append(c)
+            lst.append(c.opcode)
     return lst
 
 
-JREL_OPS = frozenset(dis.hasjrel)
-JABS_OPS = frozenset(dis.hasjabs)
-JUMP_OPS = JREL_OPS | JABS_OPS
-TERM_OPS = frozenset(_as_opcodes(['RETURN_VALUE', 'RAISE_VARARGS']))
-EXTENDED_ARG = dis.EXTENDED_ARG
-HAVE_ARGUMENT = dis.HAVE_ARGUMENT
+# JREL_OPS = frozenset(dis.hasjrel)
+# JABS_OPS = frozenset(dis.hasjabs)
+JUMP_OPS = frozenset(op.opcode for op in dis.bytecodes if op.is_jump())
+# JUMP_OPS = JREL_OPS | JABS_OPS
+TERM_OPS = frozenset(_as_opcodes(['RETURN_VALUE', 'RAISE']))
+JUMP_IMM1 = frozenset(_as_opcodes(['FOR_ITER', 'JUMP_IF_NOT_EXC_MATCH']))
+# EXTENDED_ARG = dis.EXTENDED_ARG
+# HAVE_ARGUMENT = dis.HAVE_ARGUMENT
 
 
 class ByteCodeInst(object):
@@ -62,14 +64,14 @@ class ByteCodeInst(object):
     - lineno:
         -1 means unknown
     '''
-    __slots__ = 'offset', 'next', 'opcode', 'opname', 'arg', 'lineno'
+    __slots__ = 'offset', 'next', 'opcode', 'opname', 'arg', 'lineno', 'imm'
 
-    def __init__(self, offset, opcode, arg, nextoffset):
-        self.offset = offset
-        self.next = nextoffset
-        self.opcode = opcode
-        self.opname = dis.opname[opcode]
-        self.arg = arg
+    def __init__(self, instr):
+        self.offset = instr.offset
+        self.opcode = instr.opcode
+        self.opname = dis.opname[self.opcode]
+        self.imm = instr.imm
+        self.arg = instr.imm[0] if len(instr.imm) > 0 else None
         self.lineno = -1  # unknown line number
 
     @property
@@ -82,103 +84,36 @@ class ByteCodeInst(object):
 
     def get_jump_target(self):
         assert self.is_jump
-        if self.opcode in JREL_OPS:
-            return self.next + self.arg
+        if self.opcode in JUMP_IMM1:
+            return self.offset + self.imm[1]
         else:
-            assert self.opcode in JABS_OPS
-            return self.arg
+            return self.offset + self.imm[0]
 
     def __repr__(self):
-        return '%s(arg=%s, lineno=%d)' % (self.opname, self.arg, self.lineno)
-
-    @property
-    def block_effect(self):
-        """Effect of the block stack
-        Returns +1 (push), 0 (none) or -1 (pop)
-        """
-        if self.opname.startswith('SETUP_'):
-            return 1
-        elif self.opname == 'POP_BLOCK':
-            return -1
+        if len(self.imm) == 0:
+            return '%s(lineno=%d)' % (self.opname, self.lineno)
+        elif len(self.imm) == 1:
+            return '%s(arg=%s, lineno=%d)' % (self.opname, self.arg, self.lineno)
         else:
-            return 0
-
-
-CODE_LEN = 1
-ARG_LEN = 1
-NO_ARG_LEN = 1
-
-OPCODE_NOP = dis.opname.index('NOP')
-
-
-# Adapted from Lib/dis.py
-def _unpack_opargs(code):
-    """
-    Returns a 4-int-tuple of
-    (bytecode offset, opcode, argument, offset of next bytecode).
-    """
-    extended_arg = 0
-    n = len(code)
-    offset = i = 0
-    while i < n:
-        op = code[i]
-        i += CODE_LEN
-        if op >= HAVE_ARGUMENT:
-            arg = code[i] | extended_arg
-            for j in range(ARG_LEN):
-                arg |= code[i + j] << (8 * j)
-            i += ARG_LEN
-            if op == EXTENDED_ARG:
-                extended_arg = arg << 8 * ARG_LEN
-                continue
-        else:
-            arg = None
-            i += NO_ARG_LEN
-
-        extended_arg = 0
-        yield (offset, op, arg, i)
-        offset = i  # Mark inst offset at first extended
-
-
-def _patched_opargs(bc_stream):
-    """Patch the bytecode stream.
-
-    - Adds a NOP bytecode at the start to avoid jump target being at the entry.
-    """
-    # Injected NOP
-    yield (0, OPCODE_NOP, None, _FIXED_OFFSET)
-    # Adjust bytecode offset for the rest of the stream
-    for offset, opcode, arg, nextoffset in bc_stream:
-        # If the opcode has an absolute jump target, adjust it.
-        if opcode in JABS_OPS:
-            arg += _FIXED_OFFSET
-        yield offset + _FIXED_OFFSET, opcode, arg, nextoffset + _FIXED_OFFSET
+            return '%s(args=%s, lineno=%d)' % (self.opname, str(self.imm), self.lineno)
 
 
 class ByteCodeIter(object):
     def __init__(self, code):
         self.code = code
-        self.iter = iter(_patched_opargs(_unpack_opargs(self.code.co_code)))
+        self.instrs = [ByteCodeInst(i) for i in dis.get_instructions(self.code)]
+        for bi1, bi2 in zip(self.instrs[:-1], self.instrs[1:]):
+            bi1.next = bi2.offset
+        self.iter = iter(self.instrs)
 
     def __iter__(self):
         return self
 
-    def _fetch_opcode(self):
-        return next(self.iter)
-
     def next(self):
-        offset, opcode, arg, nextoffset = self._fetch_opcode()
-        return offset, ByteCodeInst(offset=offset, opcode=opcode, arg=arg,
-                                    nextoffset=nextoffset)
+        b = next(self.iter)
+        return b.offset, b
 
     __next__ = next
-
-    def read_arg(self, size):
-        buf = 0
-        for i in range(size):
-            _offset, byte = next(self.iter)
-            buf |= byte << (8 * i)
-        return buf
 
 
 class ByteCode(object):
@@ -186,7 +121,7 @@ class ByteCode(object):
     The decoded bytecode of a function, and related information.
     """
     __slots__ = ('func_id', 'co_names', 'co_varnames', 'co_consts',
-                 'co_cellvars', 'co_freevars', 'table', 'labels')
+                 'co_cellvars', 'co_freevars', 'co_free2reg', 'num_locals', 'table', 'labels')
 
     def __init__(self, func_id):
         code = func_id.code
@@ -204,8 +139,13 @@ class ByteCode(object):
         self.co_consts = code.co_consts
         self.co_cellvars = code.co_cellvars
         self.co_freevars = code.co_freevars
+        self.co_free2reg = code.co_free2reg
+        self.num_locals = len(self.co_varnames)
         self.table = table
         self.labels = sorted(labels)
+
+        ntemp = code.co_framesize - len(self.co_varnames)
+        self.co_varnames += tuple(f'.t{i}' for i in range(ntemp))
 
     @classmethod
     def _compute_lineno(cls, table, code):

@@ -6,6 +6,7 @@ from pprint import pformat
 import logging
 from collections import namedtuple, defaultdict, deque
 from functools import total_ordering
+import opcode
 
 from numba.core.utils import UniqueDict, PYVERSION
 from numba.core.controlflow import NEW_BLOCKERS, CFGraph
@@ -85,8 +86,7 @@ class Flow(object):
         A newly forked state is then added to the list of pending states.
         The trace ends when there are no more pending states.
         """
-        firststate = State(bytecode=self._bytecode, pc=0, nstack=0,
-                           blockstack=())
+        firststate = State(bytecode=self._bytecode, pc=0)
         runner = TraceRunner(debug_filename=self._bytecode.func_id.filename)
         runner.pending.append(firststate)
 
@@ -287,6 +287,31 @@ class TraceRunner(object):
     def op_NOP(self, state, inst):
         state.append(inst)
 
+    def op_FUNC_HEADER(self, state, inst):
+        state.append(inst)
+
+    def op_COPY(self, state, inst):
+        dst = state.write_register(inst.imm[0])
+        src = state.get_register(inst.imm[1])
+        state.append(inst, dst=dst, src=src)
+
+    def op_MOVE(self, state, inst):
+        dst = state.write_register(inst.imm[0])
+        src = state.clear_register(inst.imm[1])
+        state.append(inst, dst=dst, src=src)
+
+    def op_CALL_INTRINSIC_1(self, state, inst):
+        intrinsic = opcode.intrinsics[inst.imm[0]].name
+        value = state._acc  # may be None
+        res = state.make_temp()
+        state.append(inst, intrinsic=intrinsic, value=value, res=res)
+        state.set_acc(res)
+
+    def op_CALL_INTRINSIC_N(self, state, inst):
+        res = state.make_temp()
+        state.append(inst, res=res)
+        state.set_acc(res)
+
     def op_FORMAT_VALUE(self, state, inst):
         """
         FORMAT_VALUE(flags): flags argument specifies format spec which is
@@ -321,55 +346,62 @@ class TraceRunner(object):
         state.append(inst, strings=strings, tmps=tmps)
         state.push(tmps[-1])
 
-    def op_POP_TOP(self, state, inst):
-        state.pop()
-
     def op_LOAD_GLOBAL(self, state, inst):
         res = state.make_temp()
         state.append(inst, res=res)
-        state.push(res)
+        state.set_acc(res)
 
     def op_LOAD_DEREF(self, state, inst):
         res = state.make_temp()
         state.append(inst, res=res)
-        state.push(res)
+        state.set_acc(res)
 
     def op_LOAD_CONST(self, state, inst):
         res = state.make_temp("const")
-        state.push(res)
+        state.set_acc(res)
         state.append(inst, res=res)
 
     def op_LOAD_ATTR(self, state, inst):
-        item = state.pop()
+        item = state.get_register(inst.arg)
         res = state.make_temp()
         state.append(inst, item=item, res=res)
-        state.push(res)
+        state.set_acc(res)
 
     def op_LOAD_FAST(self, state, inst):
-        name = state.get_varname(inst)
+        name = state.get_register(inst.arg)
         res = state.make_temp(name)
-        state.append(inst, res=res)
-        state.push(res)
+        state.append(inst, name=name, res=res)
+        state.set_acc(res)
 
-    def op_DELETE_FAST(self, state, inst):
+    def op_CLEAR_ACC(self, state, inst):
+        state.clear_acc()
+
+    def op_CLEAR_FAST(self, state, inst):
+        state.clear_register(inst.arg)
         state.append(inst)
 
+    def op_DELETE_FAST(self, state, inst):
+        name = state.clear_register(inst.arg)
+        state.append(inst, name=name)
+
     def op_DELETE_ATTR(self, state, inst):
-        target = state.pop()
+        target = state.acc()
         state.append(inst, target=target)
 
     def op_STORE_ATTR(self, state, inst):
-        target = state.pop()
-        value = state.pop()
+        target = state.get_register(inst.arg)
+        value = state.acc()
         state.append(inst, target=target, value=value)
 
     def op_STORE_DEREF(self, state, inst):
-        value = state.pop()
+        value = state.acc()
         state.append(inst, value=value)
 
     def op_STORE_FAST(self, state, inst):
-        value = state.pop()
-        state.append(inst, value=value)
+        name = state.write_register(inst.arg)
+        value = state.acc()
+        state.clear_acc()
+        state.append(inst, value=value, name=name)
 
     def op_SLICE_1(self, state, inst):
         """
@@ -579,31 +611,18 @@ class TraceRunner(object):
         """
         slice(TOS1, TOS) or slice(TOS2, TOS1, TOS)
         """
-        argc = inst.arg
-        if argc == 2:
-            tos = state.pop()
-            tos1 = state.pop()
-            start = tos1
-            stop = tos
-            step = None
-        elif argc == 3:
-            tos = state.pop()
-            tos1 = state.pop()
-            tos2 = state.pop()
-            start = tos2
-            stop = tos1
-            step = tos
-        else:
-            raise Exception("unreachable")
+        base = inst.arg
+        start, stop, step = [state.get_register(base + i) for i in range(3)]
         slicevar = state.make_temp()
         res = state.make_temp()
         state.append(
             inst, start=start, stop=stop, step=step, res=res, slicevar=slicevar
         )
-        state.push(res)
+        state.set_acc(res)
 
     def _op_POP_JUMP_IF(self, state, inst):
-        pred = state.pop()
+        pred = state.acc()
+        state.clear_acc()
         state.append(inst, pred=pred)
 
         target_inst = inst.get_jump_target()
@@ -617,56 +636,43 @@ class TraceRunner(object):
     op_POP_JUMP_IF_TRUE = _op_POP_JUMP_IF
     op_POP_JUMP_IF_FALSE = _op_POP_JUMP_IF
 
-    def _op_JUMP_IF_OR_POP(self, state, inst):
-        pred = state.get_tos()
+    def _op_JUMP_IF(self, state, inst):
+        pred = state.acc()
         state.append(inst, pred=pred)
-        state.fork(pc=inst.next, npop=1)
+        state.fork(pc=inst.next)
         state.fork(pc=inst.get_jump_target())
 
-    op_JUMP_IF_FALSE_OR_POP = _op_JUMP_IF_OR_POP
-    op_JUMP_IF_TRUE_OR_POP = _op_JUMP_IF_OR_POP
+    op_JUMP_IF_FALSE = _op_JUMP_IF
+    op_JUMP_IF_TRUE = _op_JUMP_IF
 
-    def op_JUMP_FORWARD(self, state, inst):
+    def op_JUMP(self, state, inst):
         state.append(inst)
         state.fork(pc=inst.get_jump_target())
-
-    def op_JUMP_ABSOLUTE(self, state, inst):
-        state.append(inst)
-        state.fork(pc=inst.get_jump_target())
-
-    def op_BREAK_LOOP(self, state, inst):
-        # NOTE: bytecode removed since py3.8
-        end = state.get_top_block('LOOP')['end']
-        state.append(inst, end=end)
-        state.pop_block()
-        state.fork(pc=end)
 
     def op_RETURN_VALUE(self, state, inst):
-        state.append(inst, retval=state.pop(), castval=state.make_temp())
+        state.append(inst, retval=state.acc(), castval=state.make_temp())
         state.terminate()
 
     def op_YIELD_VALUE(self, state, inst):
-        val = state.pop()
+        val = state.acc()
         res = state.make_temp()
         state.append(inst, value=val, res=res)
-        state.push(res)
+        state.set_acc(res)
 
-    def op_RAISE_VARARGS(self, state, inst):
+    def op_RAISE(self, state, inst):
         in_exc_block = any([
             state.get_top_block("EXCEPT") is not None,
             state.get_top_block("FINALLY") is not None
         ])
-        if inst.arg == 0:
+        if state._acc is None:
             exc = None
             if in_exc_block:
                 raise UnsupportedError(
                     "The re-raising of an exception is not yet supported.",
                     loc=self.get_debug_loc(inst.lineno),
                 )
-        elif inst.arg == 1:
-            exc = state.pop()
         else:
-            raise ValueError("Multiple argument raise is not supported.")
+            exc = state.acc()
         state.append(inst, exc=exc)
         state.terminate()
 
@@ -700,16 +706,8 @@ class TraceRunner(object):
         # we don't emulate the exact stack behavior
         state.append(inst)
 
-    def op_SETUP_LOOP(self, state, inst):
-        # NOTE: bytecode removed since py3.8
-        state.push_block(
-            state.make_block(
-                kind='LOOP',
-                end=inst.get_jump_target(),
-            )
-        )
-
     def op_SETUP_WITH(self, state, inst):
+        assert False
         cm = state.pop()    # the context-manager
 
         yielded = state.make_temp()
@@ -781,144 +779,69 @@ class TraceRunner(object):
         # Forces a new block
         state.fork(pc=inst.next)
 
-    def op_POP_BLOCK(self, state, inst):
-        blk = state.pop_block()
-        if blk['kind'] == BlockKind('TRY'):
-            state.append(inst, kind='try')
-        # Forces a new block
-        state.fork(pc=inst.next)
-
     def op_BINARY_SUBSCR(self, state, inst):
-        index = state.pop()
-        target = state.pop()
+        index = state.acc()
+        target = state.get_register(inst.arg)
         res = state.make_temp()
         state.append(inst, index=index, target=target, res=res)
-        state.push(res)
+        state.set_acc(res)
 
     def op_STORE_SUBSCR(self, state, inst):
-        index = state.pop()
-        target = state.pop()
-        value = state.pop()
+        index = state.get_register(inst.imm[1])
+        target = state.get_register(inst.imm[0])
+        value = state.acc()
         state.append(inst, target=target, index=index, value=value)
 
     def op_DELETE_SUBSCR(self, state, inst):
-        index = state.pop()
-        target = state.pop()
+        index = state.acc()
+        target = state.get_register(inst.imm[0])
         state.append(inst, target=target, index=index)
 
-    def op_CALL_FUNCTION(self, state, inst):
-        narg = inst.arg
-        args = list(reversed([state.pop() for _ in range(narg)]))
-        func = state.pop()
-
+    def op_CALL_FUNCTION(self, state, inst, is_method=False):
+        base, narg = inst.imm
+        if is_method:
+            base += 1
+            narg -= 1
+        nkwarg = narg >> 8
+        narg = narg & 0xFF
+        args = [state.clear_register(base + i) for i in range(narg)]
+        func = state.clear_register(base - 1)
+        if nkwarg > 0:
+            kwnames = state.clear_register(base - 5)
+            kwargs = [state.clear_register(base - 5 - nkwarg + i) for i in range(nkwarg)]
+        else:
+            kwnames = None
+            kwargs = ()
         res = state.make_temp()
-        state.append(inst, func=func, args=args, res=res)
-        state.push(res)
-
-    def op_CALL_FUNCTION_KW(self, state, inst):
-        narg = inst.arg
-        names = state.pop()  # tuple of names
-        args = list(reversed([state.pop() for _ in range(narg)]))
-        func = state.pop()
-
-        res = state.make_temp()
-        state.append(inst, func=func, args=args, names=names, res=res)
-        state.push(res)
+        state.append(inst, func=func, args=args, kwnames=kwnames, kwargs=kwargs, res=res)
+        state.set_acc(res)
 
     def op_CALL_FUNCTION_EX(self, state, inst):
-        if inst.arg & 1:
-            errmsg = "CALL_FUNCTION_EX with **kwargs not supported"
-            raise UnsupportedError(errmsg)
-        vararg = state.pop()
-        func = state.pop()
+        base = inst.imm[0]
+        vararg = state.clear_register(base - 6)
+        # kwarg = state.clear_register(base - 5)
+        # if kwarg is not None:
+        #     errmsg = "CALL_FUNCTION_EX with **kwargs not supported"
+        #     raise UnsupportedError(errmsg)
+        func = state.clear_register(base - 1)
         res = state.make_temp()
         state.append(inst, func=func, vararg=vararg, res=res)
-        state.push(res)
+        state.set_acc(res)
 
-    def _dup_topx(self, state, inst, count):
-        orig = [state.pop() for _ in range(count)]
-        orig.reverse()
-        # We need to actually create new temporaries if we want the
-        # IR optimization pass to work correctly (see issue #580)
-        duped = [state.make_temp() for _ in range(count)]
-        state.append(inst, orig=orig, duped=duped)
-        for val in orig:
-            state.push(val)
-        for val in duped:
-            state.push(val)
-
-    def op_DUP_TOPX(self, state, inst):
-        count = inst.arg
-        assert 1 <= count <= 5, "Invalid DUP_TOPX count"
-        self._dup_topx(state, inst, count)
-
-    def op_DUP_TOP(self, state, inst):
-        self._dup_topx(state, inst, count=1)
-
-    def op_DUP_TOP_TWO(self, state, inst):
-        self._dup_topx(state, inst, count=2)
-
-    def op_ROT_TWO(self, state, inst):
-        first = state.pop()
-        second = state.pop()
-        state.push(first)
-        state.push(second)
-
-    def op_ROT_THREE(self, state, inst):
-        first = state.pop()
-        second = state.pop()
-        third = state.pop()
-        state.push(first)
-        state.push(third)
-        state.push(second)
-
-    def op_ROT_FOUR(self, state, inst):
-        first = state.pop()
-        second = state.pop()
-        third = state.pop()
-        forth = state.pop()
-        state.push(first)
-        state.push(forth)
-        state.push(third)
-        state.push(second)
-
-    def op_UNPACK_SEQUENCE(self, state, inst):
-        count = inst.arg
-        iterable = state.pop()
-        stores = [state.make_temp() for _ in range(count)]
+    def op_UNPACK(self, state, inst):
+        base, count, after = inst.imm
+        iterable = state.acc()
+        stores = [state.write_register(base + i) for i in reversed(range(count))]
         tupleobj = state.make_temp()
         state.append(inst, iterable=iterable, stores=stores, tupleobj=tupleobj)
-        for st in reversed(stores):
-            state.push(st)
+        state.clear_acc()
 
     def op_BUILD_TUPLE(self, state, inst):
-        count = inst.arg
-        items = list(reversed([state.pop() for _ in range(count)]))
+        base, count = inst.imm
+        items = [state.clear_register(base + i) for i in range(count)]
         tup = state.make_temp()
         state.append(inst, items=items, res=tup)
-        state.push(tup)
-
-    def _build_tuple_unpack(self, state, inst):
-        # Builds tuple from other tuples on the stack
-        tuples = list(reversed([state.pop() for _ in range(inst.arg)]))
-        temps = [state.make_temp() for _ in range(len(tuples) - 1)]
-
-        # if the unpack is assign-like, e.g. x = (*y,), it needs handling
-        # differently.
-        is_assign = len(tuples) == 1
-        if is_assign:
-            temps = [state.make_temp(),]
-
-        state.append(inst, tuples=tuples, temps=temps, is_assign=is_assign)
-        # The result is in the last temp var
-        state.push(temps[-1])
-
-    def op_BUILD_TUPLE_UNPACK_WITH_CALL(self, state, inst):
-        # just unpack the input tuple, call inst will be handled afterwards
-        self._build_tuple_unpack(state, inst)
-
-    def op_BUILD_TUPLE_UNPACK(self, state, inst):
-        self._build_tuple_unpack(state, inst)
+        state.set_acc(tup)
 
     def op_LIST_TO_TUPLE(self, state, inst):
         # "Pops a list from the stack and pushes a tuple containing the same
@@ -928,118 +851,96 @@ class TraceRunner(object):
         state.append(inst, const_list=tos, res=res)
         state.push(res)
 
-    def op_BUILD_CONST_KEY_MAP(self, state, inst):
-        keys = state.pop()
-        vals = list(reversed([state.pop() for _ in range(inst.arg)]))
-        keytmps = [state.make_temp() for _ in range(inst.arg)]
-        res = state.make_temp()
-        state.append(inst, keys=keys, keytmps=keytmps, values=vals, res=res)
-        state.push(res)
-
     def op_BUILD_LIST(self, state, inst):
-        count = inst.arg
-        items = list(reversed([state.pop() for _ in range(count)]))
+        base, count = inst.imm
+        items = [state.clear_register(base + i) for i in range(count)]
         lst = state.make_temp()
         state.append(inst, items=items, res=lst)
-        state.push(lst)
+        state.set_acc(lst)
 
     def op_LIST_APPEND(self, state, inst):
-        value = state.pop()
-        index = inst.arg
-        target = state.peek(index)
+        value = state.acc()
+        target = state.get_register(inst.arg)
         appendvar = state.make_temp()
         res = state.make_temp()
         state.append(inst, target=target, value=value, appendvar=appendvar,
                      res=res)
 
     def op_LIST_EXTEND(self, state, inst):
-        value = state.pop()
-        index = inst.arg
-        target = state.peek(index)
+        value = state.acc()
+        target = state.get_register(inst.arg)
         extendvar = state.make_temp()
         res = state.make_temp()
         state.append(inst, target=target, value=value, extendvar=extendvar,
                      res=res)
+        state.clear_acc()
 
     def op_BUILD_MAP(self, state, inst):
         dct = state.make_temp()
-        count = inst.arg
-        items = []
-        # In 3.5+, BUILD_MAP takes <count> pairs from the stack
-        for i in range(count):
-            v, k = state.pop(), state.pop()
-            items.append((k, v))
-        state.append(inst, items=items[::-1], size=count, res=dct)
-        state.push(dct)
-
-    def op_MAP_ADD(self, state, inst):
-        # NOTE: https://docs.python.org/3/library/dis.html#opcode-MAP_ADD
-        # Python >= 3.8: TOS and TOS1 are value and key respectively
-        # Python < 3.8: TOS and TOS1 are key and value respectively
-        TOS = state.pop()
-        TOS1 = state.pop()
-        key, value = (TOS, TOS1) if PYVERSION < (3, 8) else (TOS1, TOS)
-        index = inst.arg
-        target = state.peek(index)
-        setitemvar = state.make_temp()
-        res = state.make_temp()
-        state.append(inst, target=target, key=key, value=value,
-                     setitemvar=setitemvar, res=res)
+        state.append(inst, res=dct)
+        state.set_acc(dct)
 
     def op_BUILD_SET(self, state, inst):
-        count = inst.arg
-        # Note: related python bug http://bugs.python.org/issue26020
-        items = list(reversed([state.pop() for _ in range(count)]))
-        res = state.make_temp()
-        state.append(inst, items=items, res=res)
-        state.push(res)
+        base, count = inst.imm
+        items = [state.get_register(base + i) for i in range(count)]
+        lst = state.make_temp()
+        state.append(inst, items=items, res=lst)
+        state.set_acc(lst)
 
     def op_SET_UPDATE(self, state, inst):
-        value = state.pop()
-        index = inst.arg
-        target = state.peek(index)
+        value = state.acc()
+        target = state.get_register(inst.arg)
         updatevar = state.make_temp()
         res = state.make_temp()
         state.append(inst, target=target, value=value, updatevar=updatevar,
                      res=res)
+        state.clear_acc()
 
     def op_GET_ITER(self, state, inst):
-        value = state.pop()
-        res = state.make_temp()
+        value = state.acc()
+        res = state.write_register(inst.arg)
         state.append(inst, value=value, res=res)
-        state.push(res)
+        state.clear_acc()
 
     def op_FOR_ITER(self, state, inst):
-        iterator = state.get_tos()
+        iterator = state.get_register(inst.imm[0])
         pair = state.make_temp()
         indval = state.make_temp()
         pred = state.make_temp()
         state.append(inst, iterator=iterator, pair=pair, indval=indval,
                      pred=pred)
-        state.push(indval)
-        end = inst.get_jump_target()
-        state.fork(pc=end, npop=2)
-        state.fork(pc=inst.next)
+        state.set_acc(indval)
+        loop = inst.get_jump_target()
+        state.fork(pc=loop)
+        state.clear_register(inst.imm[0])
+        state.fork(pc=inst.next, clear_acc=True)
 
     def _unaryop(self, state, inst):
-        val = state.pop()
+        val = state.acc()
         res = state.make_temp()
         state.append(inst, value=val, res=res)
-        state.push(res)
+        state.set_acc(res)
 
     op_UNARY_NEGATIVE = _unaryop
     op_UNARY_POSITIVE = _unaryop
     op_UNARY_NOT = _unaryop
+    op_UNARY_NOT_FAST = _unaryop
     op_UNARY_INVERT = _unaryop
 
     def _binaryop(self, state, inst):
-        rhs = state.pop()
-        lhs = state.pop()
+        rhs = state.acc()
+        lhs = state.get_register(inst.arg)
         res = state.make_temp()
         state.append(inst, lhs=lhs, rhs=rhs, res=res)
-        state.push(res)
+        state.set_acc(res)
 
-    op_COMPARE_OP = _binaryop
+    def op_COMPARE_OP(self, state, inst):
+        rhs = state.acc()
+        lhs = state.get_register(inst.imm[1])
+        res = state.make_temp()
+        state.append(inst, lhs=lhs, rhs=rhs, res=res)
+        state.set_acc(res)
+
     op_IS_OP = _binaryop
     op_CONTAINS_OP = _binaryop
 
@@ -1075,51 +976,31 @@ class TraceRunner(object):
     op_BINARY_OR = _binaryop
     op_BINARY_XOR = _binaryop
 
-    def op_MAKE_FUNCTION(self, state, inst, MAKE_CLOSURE=False):
-        name = state.pop()
-        code = state.pop()
-        closure = annotations = kwdefaults = defaults = None
-        if PYVERSION < (3, 6):
-            num_posdefaults = inst.arg & 0xFF
-            num_kwdefaults = (inst.arg >> 8) & 0xFF
-            num_annotations = (inst.arg >> 16) & 0x7FFF
-            if MAKE_CLOSURE:
-                closure = state.pop()
-            if num_annotations > 0:
-                annotations = state.pop()
-            if num_kwdefaults > 0:
-                kwdefaults = []
-                for i in range(num_kwdefaults):
-                    v = state.pop()
-                    k = state.pop()
-                    kwdefaults.append((k, v))
-                kwdefaults = tuple(kwdefaults)
-            if num_posdefaults:
-                defaults = []
-                for i in range(num_posdefaults):
-                    defaults.append(state.pop())
-                defaults = tuple(defaults)
-        else:
-            if inst.arg & 0x8:
-                closure = state.pop()
-            if inst.arg & 0x4:
-                annotations = state.pop()
-            if inst.arg & 0x2:
-                kwdefaults = state.pop()
-            if inst.arg & 0x1:
-                defaults = state.pop()
+    def op_MAKE_FUNCTION(self, state, inst):
         res = state.make_temp()
+        code = state.code_consts[inst.arg]
+        name = code.co_consts[1] if len(code.co_consts) > 0 else code.co_name
+        annotations = None
+        freevars = tuple([state.get_register(pair[0]) for pair in code.co_free2reg])
+        defaults = None
+        closure = None
+        kwdefaults = None
+
+        if code.co_ndefaultargs > 0:
+            defaults = freevars[:code.co_ndefaultargs]
+        if len(code.co_freevars) > code.co_ndefaultargs:
+            closure = freevars[code.co_ndefaultargs:]
+
         state.append(
             inst,
             name=name,
             code=code,
             closure=closure,
-            annotations=annotations,
             kwdefaults=kwdefaults,
             defaults=defaults,
             res=res,
         )
-        state.push(res)
+        state.set_acc(res)
 
     def op_MAKE_CLOSURE(self, state, inst):
         self.op_MAKE_FUNCTION(state, inst, MAKE_CLOSURE=True)
@@ -1154,17 +1035,21 @@ class TraceRunner(object):
     # of LOAD_METHOD and CALL_METHOD.
 
     def op_LOAD_METHOD(self, state, inst):
-        self.op_LOAD_ATTR(state, inst)
+        # NOTE: shifted by one compared to LOAD_ATTR
+        item = state.acc()
+        res = state.write_register(inst.imm[0] + 1)
+        state.append(inst, item=item, res=res)
+        state.set_acc(res)
 
     def op_CALL_METHOD(self, state, inst):
-        self.op_CALL_FUNCTION(state, inst)
+        self.op_CALL_FUNCTION(state, inst, is_method=True)
 
 
 @total_ordering
 class State(object):
     """State of the trace
     """
-    def __init__(self, bytecode, pc, nstack, blockstack):
+    def __init__(self, bytecode, pc, acc=None, temporaries=None):
         """
         Parameters
         ----------
@@ -1180,10 +1065,10 @@ class State(object):
         self._bytecode = bytecode
         self._pc_initial = pc
         self._pc = pc
-        self._nstack_initial = nstack
+        self._acc = acc
         self._stack = []
-        self._blockstack_initial = tuple(blockstack)
-        self._blockstack = list(blockstack)
+        self._blockstack_initial = ()
+        self._temporaries = {}
         self._temp_registers = []
         self._insts = []
         self._outedges = []
@@ -1191,18 +1076,23 @@ class State(object):
         self._phis = {}
         self._outgoing_phis = UniqueDict()
         self._used_regs = set()
-        for i in range(nstack):
+        if acc is not None:
             phi = self.make_temp("phi")
-            self._phis[phi] = i
-            self.push(phi)
+            self._phis[phi] = 'acc'
+            self.set_acc(phi)
+        if temporaries is not None:
+            for k, v in temporaries.items():
+                phi = self.make_temp("phi")
+                self._phis[phi] = k
+                self._temporaries[k] = phi
 
     def __repr__(self):
         return "State(pc_initial={} nstack_initial={})".format(
-            self._pc_initial, self._nstack_initial
+            self._pc_initial, None
         )
 
     def get_identity(self):
-        return (self._pc_initial, self._nstack_initial)
+        return (self._pc_initial, 0)
 
     def __hash__(self):
         return hash(self.get_identity())
@@ -1302,21 +1192,15 @@ class State(object):
         self._insts.append((inst.offset, kwargs))
         self._used_regs |= set(_flatten_inst_regs(kwargs.values()))
 
-    def get_tos(self):
-        return self.peek(1)
+    def set_acc(self, item):
+        self._acc = item
 
-    def peek(self, k):
-        """Return the k'th element on the stack
-        """
-        return self._stack[-k]
+    def acc(self):
+        assert self._acc is not None
+        return self._acc
 
-    def push(self, item):
-        """Push to stack"""
-        self._stack.append(item)
-
-    def pop(self):
-        """Pop the stack"""
-        return self._stack.pop()
+    def clear_acc(self):
+        self._acc = None
 
     def push_block(self, synblk):
         """Push a block to blockstack
@@ -1364,47 +1248,72 @@ class State(object):
     def get_top_block(self, kind):
         """Find the first block that matches *kind*
         """
-        kind = BlockKind(kind)
-        for bs in reversed(self._blockstack):
-            if bs['kind'] == kind:
-                return bs
+        return None
+        # kind = BlockKind(kind)
+        # for bs in reversed(self._blockstack):
+        #     if bs['kind'] == kind:
+        #         return bs
 
     def has_active_try(self):
         """Returns a boolean indicating if the top-block is a *try* block
         """
         return self.get_top_block('TRY') is not None
 
-    def get_varname(self, inst):
-        """Get referenced variable name from the oparg
-        """
-        return self._bytecode.co_varnames[inst.arg]
+    @property
+    def code_consts(self):
+        return self._bytecode.co_consts
+
+    def write_temporary(self, idx):
+        name = self.make_temp()
+        self._temporaries[idx] = name
+        return name
+
+    def clear_temporary(self, idx):
+        return self._temporaries.pop(idx)
+
+    def read_temporary(self, idx):
+        return self._temporaries[idx]
+
+    def write_register(self, idx):
+        if idx >= self._bytecode.num_locals:
+            return self.write_temporary(idx - self._bytecode.num_locals)
+        return self.get_register(idx)
+
+    def clear_register(self, idx):
+        if idx >= self._bytecode.num_locals:
+            return self.clear_temporary(idx - self._bytecode.num_locals)
+        return self.get_register(idx)
+
+    def get_register(self, idx):
+        if idx >= self._bytecode.num_locals:
+            return self.read_temporary(idx - self._bytecode.num_locals)
+        return self._bytecode.co_varnames[idx]
 
     def terminate(self):
         """Mark block as terminated
         """
         self._terminated = True
 
-    def fork(self, pc, npop=0, npush=0, extra_block=None):
+    def fork(self, pc, clear_acc=False):
         """Fork the state
         """
         # Handle changes on the stack
-        stack = list(self._stack)
-        if npop:
-            assert 0 <= npop <= len(self._stack)
-            nstack = len(self._stack) - npop
-            stack = stack[:nstack]
-        if npush:
-            assert 0 <= npush
-            for i in range(npush):
-                stack.append(self.make_temp())
-        # Handle changes on the blockstack
-        blockstack = list(self._blockstack)
-        if extra_block:
-            blockstack.append(extra_block)
-        self._outedges.append(Edge(
-            pc=pc, stack=tuple(stack), npush=npush,
-            blockstack=tuple(blockstack),
-        ))
+        acc = self._acc if not clear_acc else None
+        temporaries = dict(self._temporaries)
+        # assert npop == 0 and npush == 0
+        # if npop:
+        #     assert 0 <= npop <= len(self._stack)
+        #     nstack = len(self._stack) - npop
+        #     stack = stack[:nstack]
+        # if npush:
+        #     assert 0 <= npush
+        #     for i in range(npush):
+        #         stack.append(self.make_temp())
+        # # Handle changes on the blockstack
+        # blockstack = list(self._blockstack)
+        # if extra_block:
+        #     blockstack.append(extra_block)
+        self._outedges.append(Edge(pc=pc, acc=acc, temporaries=temporaries))
         self.terminate()
 
     def split_new_block(self):
@@ -1420,11 +1329,14 @@ class State(object):
         ret = []
         for edge in self._outedges:
             state = State(bytecode=self._bytecode, pc=edge.pc,
-                          nstack=len(edge.stack), blockstack=edge.blockstack)
+                          acc=edge.acc, temporaries=edge.temporaries)
             ret.append(state)
             # Map outgoing_phis
             for phi, i in state._phis.items():
-                self._outgoing_phis[phi] = edge.stack[i]
+                if i == 'acc':
+                    self._outgoing_phis[phi] = edge.acc
+                else:
+                    self._outgoing_phis[phi] = edge.temporaries[i]
         return ret
 
     def get_outgoing_edgepushed(self):
@@ -1436,11 +1348,12 @@ class State(object):
             values are the edge-pushed stack values
         """
 
-        return {edge.pc: tuple(edge.stack[-edge.npush:])
+        return {edge.pc: edge.acc
                 for edge in self._outedges}
 
 
-Edge = namedtuple("Edge", ["pc", "stack", "blockstack", "npush"])
+Edge = namedtuple("Edge", ["pc", "acc", "temporaries"])
+# Edge = namedtuple("Edge", ["pc", "stack", "blockstack", "npush"])
 
 
 class AdaptDFA(object):
@@ -1517,7 +1430,18 @@ class AdaptCFA(object):
         return self._blocks
 
     def iterliveblocks(self):
-        for b in sorted(self.blocks):
+        succs = self.graph._succs
+        seen = set()
+        order = []
+
+        def _dfs_rec(node):
+            if node not in seen:
+                order.append(node)
+                seen.add(node)
+                for dest in sorted(succs[node]):
+                    _dfs_rec(dest)
+        _dfs_rec(self.graph.entry_point())
+        for b in order:
             yield self.blocks[b]
 
     def dump(self):

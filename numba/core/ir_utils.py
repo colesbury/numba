@@ -1727,10 +1727,16 @@ def get_ir_of_code(glbls, fcode):
     """
     Compile a code object to get its IR, ir.Del nodes are emitted
     """
-    nfree = len(fcode.co_freevars)
+    nfree = len(fcode.co_freevars) - fcode.co_ndefaultargs
+    def make_arg(i):
+        if i >= fcode.co_argcount - fcode.co_ndefaultargs:
+            return f"x_{i}=None"
+        else:
+            return f"x_{i}"
+
     func_env = "\n".join(["  c_%d = None" % i for i in range(nfree)])
     func_clo = ",".join(["c_%d" % i for i in range(nfree)])
-    func_arg = ",".join(["x_%d" % i for i in range(fcode.co_argcount)])
+    func_arg = ",".join([make_arg(i) for i in range(fcode.co_argcount)])
 
     f = _create_function_from_code_obj(fcode, func_env, func_arg, func_clo,
                                        glbls)

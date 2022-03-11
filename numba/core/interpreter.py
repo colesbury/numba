@@ -1,10 +1,12 @@
 import builtins
 import collections
 import dis
+import heapq
 import operator
 import logging
 
 from numba.core import errors, dataflow, controlflow, ir, config
+from numba.core.analysis import compute_cfg_from_blocks
 from numba.core.errors import NotDefinedError, error_extras
 from numba.core.utils import (PYVERSION, BINOPS_TO_OPERATORS,
                               INPLACE_BINOPS_TO_OPERATORS,)
@@ -282,6 +284,134 @@ def peep_hole_list_to_tuple(func_ir):
     return func_ir
 
 
+def peep_hole_loop_reorder(func_ir):
+    """
+    Move loop iterate branch to top of loop
+    """
+    heap = []
+    seen = set()
+    keys = []
+
+    def push(offset):
+        if offset not in seen:
+            seen.add(offset)
+            heapq.heappush(heap, offset)
+
+    # push the entry point
+    push(min(func_ir.blocks.keys()))
+
+    # visit blocks in-order of reachability, preferring lower numbered blocks
+    while heap:
+        k = heapq.heappop(heap)
+        keys.append(k)
+
+        term = func_ir.blocks[k].terminator
+        if isinstance(term, ir.Branch):
+            push(term.truebr)
+            push(term.falsebr)
+        elif isinstance(term, ir.Jump):
+            push(term.target)
+
+    assert len(keys) == len(func_ir.blocks)
+    l_map = {k: k for k in keys}
+
+    # re-label blocks so that they're in ascending order
+    prev = keys[-1]
+    for k in reversed(keys[:-1]):
+        if k >= prev:
+            l_map[k] = prev - 1
+            prev = prev - 1
+        else:
+            prev = k
+
+    blocks = {l_map[k]: func_ir.blocks[k] for k in keys}
+
+    for b in blocks.values():
+        term = b.terminator
+        if isinstance(term, ir.Jump):
+            b.body[-1] = ir.Jump(l_map[term.target], term.loc)
+        if isinstance(term, ir.Branch):
+            b.body[-1] = ir.Branch(term.cond, l_map[term.truebr],
+                                   l_map[term.falsebr], term.loc)
+
+    func_ir.blocks = blocks
+    return func_ir
+
+def peep_hole_reconstruct_dict(func_ir):
+    """
+    Reconstruct literal dicts
+    """
+    def rebuild_map(blk, x):
+        build_map = x.value
+        set_items = []
+
+        for stmt in blk.body:
+            if isinstance(stmt, ir.SetItem) and stmt.target == x.target:
+                set_items.append(stmt)
+
+        if len(set_items) == 0:
+            return False
+
+        new_body = []
+        to_remove = set(set_items)
+        to_remove.add(x)
+
+        for stmt in blk.body:
+            if stmt not in to_remove:
+                new_body.append(stmt)
+            elif stmt == set_items[-1]:
+                new_body.append(x)
+
+        blk.body = new_body
+
+        def get_literals(target):
+            literal_items = []
+            for v in target:
+                defns = func_ir._definitions[v.name]
+                if len(defns) != 1:
+                    break
+                defn = defns[0]
+                if not isinstance(defn, ir.Const):
+                    break
+                literal_items.append(defn.value)
+            return literal_items
+
+        got_items = [(stmt.index, stmt.value) for stmt in set_items]
+
+        literal_keys = get_literals(x[0] for x in got_items)
+        literal_values = get_literals(x[1] for x in got_items)
+
+        has_literal_keys = len(literal_keys) == len(got_items)
+        has_literal_values = len(literal_values) == len(got_items)
+
+        value_indexes = {}
+        if not has_literal_keys and not has_literal_values:
+            literal_dict = None
+        elif has_literal_keys and not has_literal_values:
+            literal_dict = {x: _UNKNOWN_VALUE(y[1]) for x, y in
+                            zip(literal_keys, got_items)}
+            for i, k in enumerate(literal_keys):
+                value_indexes[k] = i
+        else:
+            literal_dict = {x: y for x, y in zip(literal_keys, literal_values)}
+            for i, k in enumerate(literal_keys):
+                value_indexes[k] = i
+
+        build_map.items = got_items
+        build_map.literal_value = literal_dict
+        return True
+
+    for offset, blk in func_ir.blocks.items():
+        i = 0
+        while i < len(blk.body):
+            stmt = blk.body[i]
+            if isinstance(stmt, ir.Assign):
+                if isinstance(stmt.value, ir.Expr) and stmt.value.op == 'build_map':
+                    rebuild_map(blk, stmt)
+            i += 1
+
+    return func_ir
+
 def peep_hole_delete_with_exit(func_ir):
     """
     This rewrite removes variables used to store the `__exit__` function
@@ -381,6 +511,8 @@ class Interpreter(object):
         # post process the IR to rewrite opcodes/byte sequences that are too
         # involved to risk handling as part of direct interpretation
         peepholes = []
+        peepholes.append(peep_hole_loop_reorder)
+        peepholes.append(peep_hole_reconstruct_dict)
         if PYVERSION == (3, 9):
             peepholes.append(peep_hole_list_to_tuple)
         peepholes.append(peep_hole_delete_with_exit)
@@ -456,6 +588,8 @@ class Interpreter(object):
                 oldblock.append(branch)
             # Handle normal case
             else:
+                assert False, "hmmm sam"
+                print("ADDING JUMP TO", offset)
                 jmp = ir.Jump(offset, loc=self.loc)
                 oldblock.append(jmp)
         # Get DFA block info
@@ -469,6 +603,12 @@ class Interpreter(object):
                 break
 
     def _end_current_block(self):
+        if not self.current_block.is_terminated:
+            successors = list(self.cfa.graph.successors(self.current_block_offset))
+            assert len(successors) == 1
+            jmp = ir.Jump(successors[0][0], loc=self.loc)
+            self.current_block.append(jmp)
+
         # Handle try block
         if not self.current_block.is_terminated:
             tryblk = self.dfainfo.active_try_block
@@ -655,7 +795,7 @@ class Interpreter(object):
 
     @property
     def code_names(self):
-        return self.bytecode.co_names
+        return self.bytecode.co_consts
 
     @property
     def code_cellvars(self):
@@ -736,6 +876,23 @@ class Interpreter(object):
 
     # --- Bytecode handlers ---
 
+    def op_FUNC_HEADER(self, inst):
+        code = self.func_id.func.__code__
+        ndefaults = code.co_ndefaultargs
+        if len(code.co_free2reg) == 0:
+            return
+
+        for idx, pair in enumerate(code.co_free2reg):
+            if idx < ndefaults:
+                # default arguments
+                pass
+            else:
+                # true free variables
+                name = self.code_freevars[idx]
+                value = self.get_closure_value(idx - ndefaults)
+                gl = ir.FreeVar(idx, name, value, loc=self.loc)
+                self.store(gl, self.code_locals[pair[1]])
+
     def op_NOP(self, inst):
         pass
 
@@ -752,7 +909,7 @@ class Interpreter(object):
         call = ir.Expr.call(self.get(printvar), (), (), loc=self.loc)
         self.store(value=call, name=res)
 
-    def op_UNPACK_SEQUENCE(self, inst, iterable, stores, tupleobj):
+    def op_UNPACK(self, inst, iterable, stores, tupleobj):
         count = len(stores)
         # Exhaust the iterable into a tuple-like object
         tup = ir.Expr.exhaust_iter(value=self.get(iterable), loc=self.loc,
@@ -777,6 +934,24 @@ class Interpreter(object):
         self.store(value=strgv, name=strvar)
         call = ir.Expr.call(self.get(strvar), (value,), (), loc=self.loc)
         self.store(value=call, name=res)
+
+    def find_assignment(self, target):
+        for inst in reversed(self.current_block.body):
+            if isinstance(inst, ir.Assign) and inst.target is target:
+                return inst
+
+    def op_CALL_INTRINSIC_1(self, instr, intrinsic, value, res, **kwargs):
+        if intrinsic == 'vm_format_value':
+            self.op_FORMAT_VALUE(instr, value, res)
+        elif intrinsic == 'PyList_AsTuple':
+            inst = self.find_assignment(self.get(value))
+            expr = ir.Expr.dummy('list_to_tuple', (inst.target.name,), loc=self.loc)
+            self.store(expr, res)
+        elif intrinsic == 'vm_raise_assertion_error':
+            gv_fn = ir.Global("AssertionError", AssertionError, loc=self.loc)
+            self.op_RAISE(instr, None)
+        else:
+            raise RuntimeError('intrinsic not implemented: ' + intrinsic)
 
     def op_BUILD_STRING(self, inst, strings, tmps):
         """
@@ -1022,18 +1197,25 @@ class Interpreter(object):
         stmt = ir.DelItem(base, self.get(indexvar), loc=self.loc)
         self.current_block.append(stmt)
 
-    def op_LOAD_FAST(self, inst, res):
-        srcname = self.code_locals[inst.arg]
-        self.store(value=self.get(srcname), name=res)
+    def op_LOAD_FAST(self, inst, name, res):
+        self.store(value=self.get(name), name=res)
 
-    def op_STORE_FAST(self, inst, value):
-        dstname = self.code_locals[inst.arg]
+    def op_STORE_FAST(self, inst, name, value):
         value = self.get(value)
-        self.store(value=value, name=dstname)
+        self.store(value=value, name=name)
 
-    def op_DELETE_FAST(self, inst):
+    def op_COPY(self, inst, dst, src):
+        self.store(value=self.get(src), name=dst)
+
+    def op_MOVE(self, inst, dst, src):
+        self.op_COPY(inst, dst, src)
+
+    def op_DELETE_FAST(self, inst, name):
         dstname = self.code_locals[inst.arg]
-        self.current_block.append(ir.Del(dstname, loc=self.loc))
+        self.current_block.append(ir.Del(name, loc=self.loc))
+
+    def op_CLEAR_FAST(self, inst):
+        pass
 
     def op_DUP_TOPX(self, inst, orig, duped):
         for src, dst in zip(orig, duped):
@@ -1043,7 +1225,7 @@ class Interpreter(object):
     op_DUP_TOP_TWO = op_DUP_TOPX
 
     def op_STORE_ATTR(self, inst, target, value):
-        attr = self.code_names[inst.arg]
+        attr = self.code_names[inst.imm[1]]
         sa = ir.SetAttr(target=self.get(target), value=self.get(value),
                         attr=attr, loc=self.loc)
         self.current_block.append(sa)
@@ -1055,7 +1237,7 @@ class Interpreter(object):
 
     def op_LOAD_ATTR(self, inst, item, res):
         item = self.get(item)
-        attr = self.code_names[inst.arg]
+        attr = self.code_consts[inst.imm[1]]
         getattr = ir.Expr.getattr(item, attr, loc=self.loc)
         self.store(getattr, res)
 
@@ -1088,23 +1270,20 @@ class Interpreter(object):
         self.store(gl, res)
 
     def op_LOAD_DEREF(self, inst, res):
-        n_cellvars = len(self.code_cellvars)
-        if inst.arg < n_cellvars:
-            name = self.code_cellvars[inst.arg]
-            gl = self.get(name)
-        else:
-            idx = inst.arg - n_cellvars
-            name = self.code_freevars[idx]
-            value = self.get_closure_value(idx)
-            gl = ir.FreeVar(idx, name, value, loc=self.loc)
-        self.store(gl, res)
+        srcname = self.code_locals[inst.arg]
+        # n_cellvars = len(self.code_cellvars)
+        # if inst.arg < n_cellvars:
+        #     name = self.code_cellvars[inst.arg]
+        #     gl =
+        # else:
+        #     idx = inst.arg - n_cellvars
+        #     name = self.code_freevars[idx]
+        #     value = self.get_closure_value(idx)
+        #     gl = ir.FreeVar(idx, name, value, loc=self.loc)
+        self.store(self.get(srcname), res)
 
     def op_STORE_DEREF(self, inst, value):
-        n_cellvars = len(self.code_cellvars)
-        if inst.arg < n_cellvars:
-            dstname = self.code_cellvars[inst.arg]
-        else:
-            dstname = self.code_freevars[inst.arg - n_cellvars]
+        dstname = self.code_locals[inst.arg]
         value = self.get(value)
         self.store(value=value, name=dstname)
 
@@ -1155,99 +1334,40 @@ class Interpreter(object):
             self.store(const_none, name=tmp)
             self._exception_vars.add(tmp)
 
-    if PYVERSION < (3, 6):
+    def op_CALL_FUNCTION(self, inst, func, args, kwnames, kwargs, res):
+        func = self.get(func)
+        args = [self.get(x) for x in args]
 
-        def op_CALL_FUNCTION(self, inst, func, args, kws, res, vararg):
-            func = self.get(func)
-            args = [self.get(x) for x in args]
-            if vararg is not None:
-                vararg = self.get(vararg)
-
-            # Process keywords
-            keyvalues = []
-            removethese = []
-            for k, v in kws:
-                k, v = self.get(k), self.get(v)
-                for inst in self.current_block.body:
-                    if isinstance(inst, ir.Assign) and inst.target is k:
-                        removethese.append(inst)
-                        keyvalues.append((inst.value.value, v))
-
-            # Remove keyword constant statements
-            for inst in removethese:
-                self.current_block.remove(inst)
-
-            expr = ir.Expr.call(func, args, keyvalues, loc=self.loc,
-                                vararg=vararg)
-            self.store(expr, res)
-
-        op_CALL_FUNCTION_VAR = op_CALL_FUNCTION
-    else:
-        def op_CALL_FUNCTION(self, inst, func, args, res):
-            func = self.get(func)
-            args = [self.get(x) for x in args]
-            expr = ir.Expr.call(func, args, (), loc=self.loc)
-            self.store(expr, res)
-
-        def op_CALL_FUNCTION_KW(self, inst, func, args, names, res):
-            func = self.get(func)
-            args = [self.get(x) for x in args]
-            # Find names const
-            names = self.get(names)
+        def find_assignemnt(target):
             for inst in self.current_block.body:
-                if isinstance(inst, ir.Assign) and inst.target is names:
+                if isinstance(inst, ir.Assign) and inst.target is target:
                     self.current_block.remove(inst)
-                    # scan up the block looking for the values, remove them
-                    # and find their name strings
-                    named_items = []
-                    for x in inst.value.items:
-                        for y in self.current_block.body[::-1]:
-                            if x == y.target:
-                                self.current_block.remove(y)
-                                named_items.append(y.value.value)
-                                break
-                    keys = named_items
-                    break
+                    return inst
 
-            nkeys = len(keys)
-            posvals = args[:-nkeys]
-            kwvals = args[-nkeys:]
-            keyvalues = list(zip(keys, kwvals))
+        keyvalues = ()
+        if kwnames:
+            kwargs = [self.get(x) for x in kwargs]
+            kwnames = self.get(kwnames)
 
-            expr = ir.Expr.call(func, posvals, keyvalues, loc=self.loc)
-            self.store(expr, res)
+            const_temp = find_assignemnt(kwnames)
+            const_value = const_temp #find_assignemnt(const_temp.value)
+            keys = []
+            for x in const_value.value.items:
+                for y in self.current_block.body[::-1]:
+                    if x == y.target:
+                        self.current_block.remove(y)
+                        keys.append(y.value.value)
+                        break
+            keyvalues = list(zip(keys, kwargs))
 
-        def op_CALL_FUNCTION_EX(self, inst, func, vararg, res):
-            func = self.get(func)
-            vararg = self.get(vararg)
-            expr = ir.Expr.call(func, [], [], loc=self.loc, vararg=vararg)
-            self.store(expr, res)
+        expr = ir.Expr.call(func, args, keyvalues, loc=self.loc)
+        self.store(expr, res)
 
-    def _build_tuple_unpack(self, inst, tuples, temps, is_assign):
-        first = self.get(tuples[0])
-        if is_assign:
-            # it's assign-like, defer handling to an intrinsic that will have
-            # type information.
-            # Can deal with tuples only, i.e. y = (*x,). where x = <tuple>
-            gv_name = "unpack_single_tuple"
-            gv_fn = ir.Global(gv_name, unpack_single_tuple, loc=self.loc,)
-            self.store(value=gv_fn, name=gv_name, redefine=True)
-            exc = ir.Expr.call(self.get(gv_name), args=(first,), kws=(),
-                               loc=self.loc,)
-            self.store(exc, temps[0])
-        else:
-            for other, tmp in zip(map(self.get, tuples[1:]), temps):
-                out = ir.Expr.binop(fn=operator.add, lhs=first, rhs=other,
-                                    loc=self.loc)
-                self.store(out, tmp)
-                first = self.get(tmp)
-
-    def op_BUILD_TUPLE_UNPACK_WITH_CALL(self, inst, tuples, temps, is_assign):
-        # just unpack the input tuple, call inst will be handled afterwards
-        self._build_tuple_unpack(inst, tuples, temps, is_assign)
-
-    def op_BUILD_TUPLE_UNPACK(self, inst, tuples, temps, is_assign):
-        self._build_tuple_unpack(inst, tuples, temps, is_assign)
+    def op_CALL_FUNCTION_EX(self, inst, func, vararg, res):
+        func = self.get(func)
+        vararg = self.get(vararg)
+        expr = ir.Expr.call(func, [], [], loc=self.loc, vararg=vararg)
+        self.store(expr, res)
 
     def op_LIST_TO_TUPLE(self, inst, const_list, res):
         expr = ir.Expr.dummy('list_to_tuple', (const_list,), loc=self.loc)
@@ -1343,8 +1463,8 @@ class Interpreter(object):
         self.store(isvalid, pred)
 
         # Conditional jump
-        br = ir.Branch(cond=self.get(pred), truebr=inst.next,
-                       falsebr=inst.get_jump_target(),
+        br = ir.Branch(cond=self.get(pred), truebr=inst.get_jump_target(),
+                       falsebr=inst.next,
                        loc=self.loc)
         self.current_block.append(br)
 
@@ -1359,7 +1479,7 @@ class Interpreter(object):
         target = self.get(target)
         value = self.get(value)
         stmt = ir.SetItem(target=target, index=index, value=value,
-                          loc=self.loc)
+                        loc=self.loc)
         self.current_block.append(stmt)
 
     def op_DELETE_SUBSCR(self, inst, target, index):
@@ -1392,54 +1512,12 @@ class Interpreter(object):
                                   loc=self.loc)
         self.store(value=updateinst, name=res)
 
-    def op_BUILD_MAP(self, inst, items, size, res):
-        got_items = [(self.get(k), self.get(v)) for k, v in items]
-
-        # sort out literal values, this is a bit contrived but is to handle
-        # situations like `{1: 10, 1: 10}` where the size of the literal dict
-        # is smaller than the definition
-        def get_literals(target):
-            literal_items = []
-            values = [self.get(v.name) for v in target]
-            for v in values:
-                defns = self.definitions[v.name]
-                if len(defns) != 1:
-                    break
-                defn = defns[0]
-                if not isinstance(defn, ir.Const):
-                    break
-                literal_items.append(defn.value)
-            return literal_items
-
-        literal_keys = get_literals(x[0] for x in got_items)
-        literal_values = get_literals(x[1] for x in got_items)
-
-        has_literal_keys = len(literal_keys) == len(got_items)
-        has_literal_values = len(literal_values) == len(got_items)
-
-        value_indexes = {}
-        if not has_literal_keys and not has_literal_values:
-            literal_dict = None
-        elif has_literal_keys and not has_literal_values:
-            literal_dict = {x: _UNKNOWN_VALUE(y[1]) for x, y in
-                            zip(literal_keys, got_items)}
-            for i, k in enumerate(literal_keys):
-                value_indexes[k] = i
-        else:
-            literal_dict = {x: y for x, y in zip(literal_keys, literal_values)}
-            for i, k in enumerate(literal_keys):
-                value_indexes[k] = i
-
-        expr = ir.Expr.build_map(items=got_items, size=size,
-                                 literal_value=literal_dict,
-                                 value_indexes=value_indexes,
+    def op_BUILD_MAP(self, inst, res):
+        expr = ir.Expr.build_map(items=[], size=0,
+                                 literal_value=None,
+                                 value_indexes={},
                                  loc=self.loc)
         self.store(expr, res)
-
-    def op_STORE_MAP(self, inst, dct, key, value):
-        stmt = ir.StoreMap(dct=self.get(dct), key=self.get(key),
-                           value=self.get(value), loc=self.loc)
-        self.current_block.append(stmt)
 
     def op_UNARY_NEGATIVE(self, inst, value, res):
         value = self.get(value)
@@ -1460,6 +1538,8 @@ class Interpreter(object):
         value = self.get(value)
         expr = ir.Expr.unary('not', value=value, loc=self.loc)
         return self.store(expr, res)
+
+    op_UNARY_NOT_FAST = op_UNARY_NOT
 
     def _binop(self, op, lhs, rhs, res):
         op = BINOPS_TO_OPERATORS[op]
@@ -1561,11 +1641,7 @@ class Interpreter(object):
     def op_INPLACE_XOR(self, inst, lhs, rhs, res):
         self._inplace_binop('^', lhs, rhs, res)
 
-    def op_JUMP_ABSOLUTE(self, inst):
-        jmp = ir.Jump(inst.get_jump_target(), loc=self.loc)
-        self.current_block.append(jmp)
-
-    def op_JUMP_FORWARD(self, inst):
+    def op_JUMP(self, inst):
         jmp = ir.Jump(inst.get_jump_target(), loc=self.loc)
         self.current_block.append(jmp)
 
@@ -1607,17 +1683,11 @@ class Interpreter(object):
 
     def op_IS_OP(self, inst, lhs, rhs, res):
         # invert if op case is 1
-        op = 'is not' if inst.arg == 1 else 'is'
-        self._binop(op, lhs, rhs, res)
+        self._binop('is', lhs, rhs, res)
 
     def op_CONTAINS_OP(self, inst, lhs, rhs, res):
         lhs, rhs = rhs, lhs
         self._binop('in', lhs, rhs, res)
-        # invert if op case is 1
-        if inst.arg == 1:
-            tmp = self.get(res)
-            out = ir.Expr.unary('not', value=tmp, loc=self.loc)
-            self.store(out, res)
 
     def op_BREAK_LOOP(self, inst, end=None):
         if end is None:
@@ -1692,7 +1762,7 @@ class Interpreter(object):
         stmt = ir.StaticRaise(AssertionError, (msg,), self.loc)
         self.current_block.append(stmt)
 
-    def op_RAISE_VARARGS(self, inst, exc):
+    def op_RAISE(self, inst, exc):
         if exc is not None:
             exc = self.get(exc)
         tryblk = self.dfainfo.active_try_block
@@ -1713,55 +1783,20 @@ class Interpreter(object):
         inst = ir.Yield(value=self.get(value), index=index, loc=self.loc)
         return self.store(inst, res)
 
-    def op_MAKE_FUNCTION(self, inst, name, code, closure, annotations,
-                         kwdefaults, defaults, res):
+    def op_MAKE_FUNCTION(self, inst, name, code, closure, kwdefaults, defaults, res):
         # annotations are ignored by numba but useful for static analysis
         # re. https://github.com/numba/numba/issues/7269
         if kwdefaults is not None:
             msg = "op_MAKE_FUNCTION with kwdefaults is not implemented"
             raise NotImplementedError(msg)
         if defaults:
-            if isinstance(defaults, tuple):
-                defaults = tuple([self.get(name) for name in defaults])
-            else:
-                defaults = self.get(defaults)
-
-        assume_code_const = self.definitions[code][0]
-        if not isinstance(assume_code_const, ir.Const):
-            msg = (
-                "Unsupported use of closure. "
-                "Probably caused by complex control-flow constructs; "
-                "e.g. try-except"
-            )
-            raise errors.UnsupportedError(msg, loc=self.loc)
-        fcode = assume_code_const.value
-        if name:
-            name = self.get(name)
+            defaults = tuple([self.get(name) for name in defaults])
         if closure:
-            closure = self.get(closure)
-        expr = ir.Expr.make_function(name, fcode, closure, defaults, self.loc)
+            closure = ir.Expr.build_tuple(items=[self.get(name) for name in closure],
+                                          loc=self.loc)
+        name = ir.Const(name, loc=self.loc)
+        expr = ir.Expr.make_function(name, code, closure, defaults, self.loc)
         self.store(expr, res)
-
-    def op_MAKE_CLOSURE(self, inst, name, code, closure, annotations,
-                        kwdefaults, defaults, res):
-        self.op_MAKE_FUNCTION(inst, name, code, closure, annotations,
-                              kwdefaults, defaults, res)
-
-    def op_LOAD_CLOSURE(self, inst, res):
-        n_cellvars = len(self.code_cellvars)
-        if inst.arg < n_cellvars:
-            name = self.code_cellvars[inst.arg]
-            try:
-                gl = self.get(name)
-            except NotDefinedError:
-                msg = "Unsupported use of op_LOAD_CLOSURE encountered"
-                raise NotImplementedError(msg)
-        else:
-            idx = inst.arg - n_cellvars
-            name = self.code_freevars[idx]
-            value = self.get_closure_value(idx)
-            gl = ir.FreeVar(idx, name, value, loc=self.loc)
-        self.store(gl, res)
 
     def op_LIST_APPEND(self, inst, target, value, appendvar, res):
         target = self.get(target)
@@ -1834,16 +1869,6 @@ class Interpreter(object):
             extendinst = ir.Expr.call(self.get(extendvar), (value,), (),
                                       loc=self.loc)
             self.store(value=extendinst, name=res)
-
-    def op_MAP_ADD(self, inst, target, key, value, setitemvar, res):
-        target = self.get(target)
-        key = self.get(key)
-        value = self.get(value)
-        setitemattr = ir.Expr.getattr(target, '__setitem__', loc=self.loc)
-        self.store(value=setitemattr, name=setitemvar)
-        appendinst = ir.Expr.call(self.get(setitemvar), (key, value,), (),
-                                  loc=self.loc)
-        self.store(value=appendinst, name=res)
 
     def op_LOAD_ASSERTION_ERROR(self, inst, res):
         gv_fn = ir.Global("AssertionError", AssertionError, loc=self.loc)
